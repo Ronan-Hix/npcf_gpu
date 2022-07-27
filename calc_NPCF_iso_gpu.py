@@ -29,8 +29,6 @@ def P_lambda_gpu(coords, order='11(0)11', npcf=3):
         
         r1_hat = (coords[:,0,:].T/cp.linalg.norm(coords[:,0,:], ord=2, axis=1)).T
         r2_hat = (coords[:,1,:].T/cp.linalg.norm(coords[:,1,:], ord=2, axis=1)).T
-        #r1_hat = coords[:,0,:] #For testing
-        #r2_hat = coords[:,1,:]
         
         if order == '00':
             return 1./4/np.pi * cp.ones(r1_hat.shape[0])
@@ -138,7 +136,7 @@ def P_lambda_gpu(coords, order='11(0)11', npcf=3):
 
 class calc_NPCF(object):
     
-    def __init__(self, npcf=None, ngals=None, nbins=None, lbox=None, rmax=None, lls=None, verbose=False, array_mode=True):
+    def __init__(self, npcf=None, ngals=None, nbins=None, lbox=None, rmax=None, Nmax=None, lls=None, verbose=False, array_mode=True):
         
         self.npcf  = npcf
         self.ngals = ngals
@@ -148,6 +146,7 @@ class calc_NPCF(object):
         self.verbose = verbose
         self.array_mode = array_mode
         self.Nmax = Nmax
+        self.problems = 0
         
         if lls is not None:
             self.lls = lls
@@ -163,7 +162,7 @@ class calc_NPCF(object):
             elif self.npcf == 6:
                 self.lls = ['00(0)0(0)0', '11(0)0(0)0', '00(0)1(1)10','10(1)1(1)01', '10(1)1(2)02']
                        
-    def init_coeff(self):
+    def init_coeff(self,Numblocks):
         
         '''initialize coefficients'''
         
@@ -172,8 +171,8 @@ class calc_NPCF(object):
         self.zeta_im = {}
         for il in self.lls:
             self.zeta[il] = cp.zeros([self.nbins]*int(self.npcf-1), dtype='c16')
-            self.zeta_re[il] = cp.zeros([200000]+[self.nbins]*int(self.npcf-1), dtype='f8')
-            self.zeta_im[il] = cp.zeros([200000]+[self.nbins]*int(self.npcf-1), dtype='f8')
+            self.zeta_re[il] = cp.zeros([Numblocks]+[self.nbins]*int(self.npcf-1), dtype='f8')
+            self.zeta_im[il] = cp.zeros([Numblocks]+[self.nbins]*int(self.npcf-1), dtype='f8')
             
     def save(self, sname, infile=None):
         
@@ -216,7 +215,9 @@ class calc_NPCF(object):
         numpy.random.seed(10)
         eps = 1e-8
         #print(cp.cuda.Device().attributes)
-        #Define coords and computationally expensive combinatorics
+        
+        # Define coords and computationally expensive combinatorics
+        # that can be referenced by every primary galaxy loop
         self.galcoords = self.lbox * np.random.rand(self.ngals, 3)
         tree = spatial.cKDTree(self.galcoords,leafsize=self.lbox)
         galcoords_gpu = cp.array(self.galcoords, dtype=cp.float64)
@@ -239,19 +240,12 @@ class calc_NPCF(object):
             self.shortvec = self.short3
             self.intvec = self.int3
             
-        #tracemalloc.start()
-        print('Start')
-        
-        #test_cpu = np.ones((5000000000,3),dtype='int16')
-        #test = cp.asarray(test_cpu[:2500000000,:], dtype='int16')
-        #print(f"Test (MB): {test.nbytes/1024/1024}")
-        
-        #masterballct = cp.array(list(combinations(np.arange(np.min([Nmax,len(self.galcoords)]),dtype=dtype), int(self.npcf-1))),dtype=dtype)
+            
+        # Find all possible combinations for Nmax or total number
+        # of neighbouring galaxies (whichever is smaller). 
+        # masterballct is an object that contains a list of tuples of the indices of secondary galaxies
         tcomb1 = time.time()
         combo = combinations(np.arange(np.min([self.Nmax,len(self.galcoords)]),dtype=self.intdtype), int(self.npcf-1))
-        #memsize, mempeak = tracemalloc.get_traced_memory()
-        #print(f"Peak (MB): {mempeak/1024/1024}")
-        #print(combo.nbytes/1024/1024)
         masterballct_cpu = np.fromiter(chain.from_iterable(combo),dtype=self.intdtype).reshape(-1,int(self.npcf-1))
         tcomb2 = time.time()
         print(f"tcomb: {tcomb2- tcomb1}")
@@ -259,18 +253,14 @@ class calc_NPCF(object):
         print(f"Mem Total: {mempool.total_bytes()/1024/1024}")
         print(f"Mem Used: {mempool.used_bytes()/1024/1024}")
         masterballct = cp.asarray(masterballct_cpu, dtype='int16')
-        #print(type(int(self.npcf-1)))
-        #print(np.arange(np.min([Nmax,len(self.galcoords)]),dtype='int32').dtype)
-        
-        #memsize, mempeak = tracemalloc.get_traced_memory()
-        #print(f"Peak (MB): {mempeak/1024/1024}")
-        
-        #masterballct = cp.asarray(masterballct_cpu,dtype='int32')
-        #print(masterballct.shape)
-        #Currently capped at 10,000 neighbors for memory/speed reasons (Cap can be changed at will)
-        allsides = cp.asarray(list(combinations(numpy.arange(self.nbins), int(self.npcf-1))),dtype='int32')
         t2 = time.time()
         print(f"time: {t2-t1}")
+        
+        #Calculates the optimal number of blocks and assigns storage array
+        self.Numblocks = math.ceil(masterballct.shape[0]/1024)+1
+        print(f"Number of Blocks: {self.Numblocks}")
+        self.init_coeff(self.Numblocks)
+        
         
         
         #C++ Code for CUDA Kernels
@@ -318,6 +308,8 @@ class calc_NPCF(object):
         }
         '''
         code_manip='''
+        // Returns only partner pairs with partners that are
+        // in the sphere containing neighbors
         extern "C" __global__ void get_ballct_3PCF(const short2* masterballct,
                                             int in_shape,
                                             int n_neighbors,
@@ -330,7 +322,8 @@ class calc_NPCF(object):
                 out[i] = masterballct[i] ;
             }            
         }
-
+        // Returns only partner triplets with partners that are
+        // in the sphere containing neighbors
         extern "C" __global__ void get_ballct_4PCF(const short3* masterballct,
                                             int in_shape,
                                             int n_neighbors,
@@ -344,7 +337,7 @@ class calc_NPCF(object):
                 out[i] = masterballct[i] ;
             }            
         }
-
+        // Assigns side pairs to radial bins
         extern "C" __global__ void get_sides_3PCF(const double* rad_coord,
                                             short2* index,
                                             int shape,
@@ -358,7 +351,7 @@ class calc_NPCF(object):
             }
         }
         
-
+        // Assigns side triplets to radial bins
         extern "C" __global__ void get_sides_4PCF(const double* rad_coord,
                                             short3* index,
                                             int shape,
@@ -405,6 +398,7 @@ class calc_NPCF(object):
         }
         
         //3PCF Definitions 
+        //Calculates 3PCF coefficents - Currently unused
         extern "C" __global__ void N3_coeff(const double3* coords,
                                                     int2* indices,
                                                     complex<double>* out_00, 
@@ -422,7 +416,7 @@ class calc_NPCF(object):
               out_22[i] = (3./2.)*sqrtf(5./pow(4.*PI,2.))*(pow(dot(r1_hat,r2_hat),2.) - 1./3.);
           }
         }
-
+        //Calculates 3PCF coefficents - Currently unused
         extern "C" __global__ void N4_coeff(const double3* coords,
                                                     short3* indices,
                                                     short3* sides,
@@ -455,7 +449,7 @@ class calc_NPCF(object):
               }
           }
         }
-
+        //Calculates 3PCF coefficents and adds them to appropriate output array
         extern "C" __global__ void N3_coeff_add(const double3* coords,
                                                     short2* indices,
                                                     short2* sides,
@@ -475,7 +469,8 @@ class calc_NPCF(object):
                 atomicAdd(&out_11_re[(sides[i].y+(out_shape.y*sides[i].x))+(out_shape.x*out_shape.y*blockIdx.x)],-sqrtf(3.)/(4.*PI)*dot(r1_hat,r2_hat));
                 atomicAdd(&out_22_re[(sides[i].y+(out_shape.y*sides[i].x))+(out_shape.x*out_shape.y*blockIdx.x)],(3./2.)*sqrtf(5./pow(4.*PI,2.))*(pow(dot(r1_hat,r2_hat),2.) - 1./3.));
             }
-        }                                             
+        }
+        //Calculates 4PCF coefficents and adds them to appropriate output array
         extern "C" __global__ void N4_coeff_add(const double3* coords,
                                                     short3* indices,
                                                     short3* sides,
@@ -542,31 +537,29 @@ class calc_NPCF(object):
         
         self.sides = []
         for ii in range(self.ngals): 
-            self.run_1_gal(ii,eps,tree,galcoords_gpu,masterballct,allsides)
-            #print(benchmark(self.run_1_gal,(ii,eps,tree,galcoords_gpu,masterballct,allsides), n_repeat=2,n_warmup=2))
+            self.run_1_gal(ii,eps,tree,galcoords_gpu,masterballct)
+            #print(benchmark(self.run_1_gal,(ii,eps,tree,galcoords_gpu,masterballct), n_repeat=2,n_warmup=2))
         for il in self.lls:
             self.zeta[il] = cp.sum(self.zeta_re[il],axis=0) + 1j*cp.sum(self.zeta_im[il],axis=0)
+        print(f"Problems Encountered: {self.problems}")
         #print(self.zeta)
             
-    def run_1_gal(self,ii,eps,tree,galcoords_gpu,masterballct,allsides):
+    def run_1_gal(self,ii,eps,tree,galcoords_gpu,masterballct):
         print(f">> sit on {ii}th galaxy")
         mempool = cp.get_default_memory_pool()
         print(f"Mem tot: {mempool.total_bytes()/1024/1024}")
         print(f"Mem used: {mempool.used_bytes()/1024/1024}")
         
-
         prime_coord_3d = galcoords_gpu[ii]
 
-        # ballct: list of indices of the secondary galaxies of
-        # the current primary galaxy
-
+        # ballct: list of indices of the secondary galaxies of the current primary galaxy
         ballct = tree.query_ball_point(self.galcoords[ii], self.rmax+eps)
         ballct.remove(ii)
 
-        # coordinate of the secondary galaxies 
-        second_coord_3d = galcoords_gpu[ballct] - prime_coord_3d
+        # coordinates of the secondary galaxies 
+        second_coord_3d = galcoords_gpu[ballct] - prime_coord_3d   
+        second_coord_radial = cp.sqrt(cp.sum(second_coord_3d**2, axis=1))
         if second_coord_3d.shape[0] >= (self.npcf-1): #Excludes primaries with too few secondaries
-            second_coord_radial = cp.sqrt(cp.sum(second_coord_3d**2, axis=1))
 
             # sort the secondary galaxies according to their distance
             sort = second_coord_radial.argsort()
@@ -576,20 +569,23 @@ class calc_NPCF(object):
             
             print(f"Num Secondaries: {second_coord_3d.shape[0]}")
             if len(second_coord_3d) > self.Nmax:
-                print("Number of secondaries is greater than the number computed")
+                print("Warning: Number of secondaries is greater than the number computed")
+                self.problems += 1
                 return 0
             
-            # find all possible combinations for N-1 neighbouring galaxies 
-            # out of total secondary galaxies. comb_ballct is an object that 
-            # contains a list of tuples of the indices of secondary galaxies
-            comb_ballct_arr =  cp.zeros((len(masterballct),(self.npcf-1)), dtype='int16').view(self.shortvec)  
-            Numblocks = math.ceil(comb_ballct_arr.shape[0]/1024)
-            print(Numblocks)
-            self.ballct_func((100000,), (1024,),(masterballct.view(self.shortvec),masterballct.shape[0],second_coord_3d.shape[0],comb_ballct_arr))
-            #comb_ballct_arr = cp.compress(cp.all(masterballct < len(second_coord_3d),axis=1),masterballct,axis=0)  
-            #Gets 3D & Radial coords for all N-1 secondary galaxies           
-            #second_coord_3d_np = second_coord_3d[comb_ballct_arr,:]
-            #second_coord_radial_np = second_coord_radial[comb_ballct_arr]
+
+            #Calculates the number of blocks needed - Should agree with self.Numblocks  
+            Numblocks_min = math.ceil(masterballct.shape[0]/1024)+1
+            if self.Numblocks < Numblocks_min:
+                self.problems += 1
+                print("Warning: Number of blocks is fewer than required, computation output will be incorrect")
+            print(f"{self.Numblocks=}, {Numblocks_min=}")
+            
+            # Creates holder array for secondary combinations then
+            # populates with the entries from masterballct only if they are
+            # possible with the actual number of secondaries
+            comb_ballct_arr =  cp.zeros((len(masterballct),(self.npcf-1)), dtype='int16').view(self.shortvec)
+            self.ballct_func((self.Numblocks,), (1024,),(masterballct.view(self.shortvec),masterballct.shape[0],second_coord_3d.shape[0],comb_ballct_arr))
             
             #print(second_coord_3d_np.shape)
             #print(f"Coords: {second_coord_3d_np.nbytes/1024/1024}")
@@ -599,78 +595,38 @@ class calc_NPCF(object):
 
     #            if self.verbose: print(f"  position of {self.npcf-1:1d} secondary galaxies:\n", second_coord_3d_np)
 
-            #sides_real = cp.trunc(second_coord_radial_np/self.rmax*self.nbins) 
+
         
             #Gets the radial bin index of the N-1 secondary galaxies
-            #comb_ballct_arr = comb_ballct_arr.view(self.shortvec)
             sides = cp.zeros((len(comb_ballct_arr),(self.npcf-1)), dtype='int16').view(self.shortvec)
-            self.sides_func((200000,), (1024,),(second_coord_radial,comb_ballct_arr,len(comb_ballct_arr),self.rmax,self.nbins,sides))
-            #print(f"Sides: {sides.nbytes/1024/1024}")
-            #print(f"Mem: {mempool.total_bytes()/1024/1024}")
-            #print(f"Mem: {mempool.used_bytes()/1024/1024}")
-            #notsamebin = cp.all(cp.diff(sides, axis=1) != 0,axis=1)
-            #sides = cp.compress(notsamebin,sides,axis=0)
-            #second_coord_3d_np = cp.compress(notsamebin,second_coord_3d_np,axis=0) #Omits side pairs in the same radial bin
-            #print(f"a{comb_ballct_arr}")
-            #if self.npcf == 3:    
-            #    indices = cp.compress(notsamebin,comb_ballct_arr,axis=0).astype('int32').view(self.int2)
-            #elif self.npcf ==4:
-            #    indices = cp.compress(notsamebin,comb_ballct_arr,axis=0).astype('int32').view(self.int3)
-             #Omits side pairs in the same radial bin
-            #print(indices)
+            self.sides_func((self.Numblocks,), (1024,),(second_coord_radial,comb_ballct_arr,len(comb_ballct_arr),self.rmax,self.nbins,sides))
             
+            #print(f"Sides: {sides.nbytes/1024/1024}")
+            print(f"Mem: {mempool.total_bytes()/1024/1024}")
+            print(f"Mem: {mempool.used_bytes()/1024/1024}")
+
             if sides.shape[0] >= 1: #Excludes primaries with too few secondaries
-                #print(f"Sides shape: {sides.shape}")
-                #for il in self.lls:
-                    #new_zeta[il] = cp.zeros(comb_ballct_arr.shape[0],dtype='complex128')
                 second_coord_3d = second_coord_3d.view(self.double3)   
                 if self.npcf ==3:
-                    #r1 = second_coord_3d_np[:,0,:].astype(np.float64).view(self.double3) #Creates coordinate vector objects
-                    #r2 = second_coord_3d_np[:,1,:].astype(np.float64).view(self.double3)
-                    #self.N3((100000,), (1024,),(second_coord_3d,indices,
-                                                #new_zeta['00'],new_zeta['11'],new_zeta['22'],
-                                                #new_zeta['00'].shape[0])) #Calculates Coeffs
+                    #Shape of the output array - used for indexing in function call
                     shape = np.asarray([self.zeta_re[self.lls[0]].shape[1],self.zeta_re[self.lls[0]].shape[2]]).astype(np.int32).view(self.int2)
-                    self.N3_and_add((200000,), (1024,),(second_coord_3d,comb_ballct_arr,sides,
+                    #Calculates coefficients and adds them to zeta
+                    self.N3_and_add((self.Numblocks,), (1024,),(second_coord_3d,comb_ballct_arr,sides,
                                                         self.zeta_re['00'],self.zeta_re['11'],self.zeta_re['22'],
                                                         comb_ballct_arr.shape[0],shape))
-                    #sides_to_pass = sides.astype(np.int32).view(self.short2)[:,0]
-                    #for il in self.lls:
-                    #    self.add_func((200000,), (512,),(sides.astype(np.int32).view(self.short2)[:,0],shape,new_zeta[il].shape[0],
-                    #                                     new_zeta[il],self.zeta_re[il],self.zeta_im[il])) #Adds results to Zeta result array
                 elif self.npcf == 4:
-                    #r1 = second_coord_3d_np[:,0,:].astype(np.float64).view(self.double3) #Creates coordinate vector objects
-                    #r2 = second_coord_3d_np[:,1,:].astype(np.float64).view(self.double3)
-                    #r3 = second_coord_3d_np[:,2,:].astype(np.float64).view(self.double3)
-                    #print(f"ind: {comb_ballct_arr}")
-                    #print(second_coord_3d)
-                    #print(second_coord_radial_np)
-                    '''
-                    #second_coord_3d = second_coord_3d.view(self.double3)
-                    self.N4((100000,), (1024,),(second_coord_3d.view(self.double3),comb_ballct_arr.view(self.short3),sides.view(self.short3)[:,0],
-                                                new_zeta['110'],new_zeta['111'],new_zeta['112'],new_zeta['222'],
-                                                new_zeta['110'].shape[0])) #Calculates coeffs'''
-
-
+                    #Shape of the output array - used for indexing in function call
                     shape = np.asarray([
                         self.zeta_re[self.lls[0]].shape[1],
                         self.zeta_re[self.lls[0]].shape[2],
                         self.zeta_re[self.lls[0]].shape[3]]).astype(np.int32).view(self.int3)
-                    second_coord_3d = second_coord_3d.view(self.double3)
-                    #print('Here')
-                    '''
-                    for il in self.lls:
-                        self.add_func((200000,), (1024,),(sides,
-                                                          shape,new_zeta[il].shape[0],new_zeta[il],
-                                                          self.zeta_re[il],self.zeta_im[il])) #Adds results to Zeta result array'''
-     
-
-                    self.N4_and_add((200000,), (1024,),(second_coord_3d,comb_ballct_arr,sides,
+                    #Calculates coefficients and adds them to zeta arrray
+                    self.N4_and_add((self.Numblocks,), (1024,),(second_coord_3d,comb_ballct_arr,sides,
                                                         self.zeta_re['110'],self.zeta_im['111'],self.zeta_re['112'],self.zeta_re['222'],
-                                                        comb_ballct_arr.shape[0],shape)) #Calculates coeffs and adds them to the zeta array
-                #mempool.free_all_blocks()
-                #print(f"Mem: {mempool.total_bytes()/1024/1024}")
-                #print(f"Mem: {mempool.used_bytes()/1024/1024}")
+                                                        comb_ballct_arr.shape[0],shape))
+                    
+                print(f"Mem: {mempool.total_bytes()/1024/1024}")
+                print(f"Mem: {mempool.used_bytes()/1024/1024}")
         #                if self.verbose: print("    order", il, "coefficients",new_zeta)
         #         self.zeta = numpy.average(numpy.array(list(self.zeta.values())),axis=0).real
                 #print(self.zeta_im['110'])
@@ -681,16 +637,17 @@ if __name__ == "__main__":
     start_time = time.time()
 
     npcf = 3
-    ngals = 20000
+    ngals = 500000
     nbins = 10
     lbox = 20
-    rmax = 20
-    Nmax = 25000
+    rmax = 2
+    Nmax = 5000
+    #Numblocks = 306000
     # lls_5pcf = ['11(0)11', '21(1)12']
     verbose=False
     
-    zetas = calc_NPCF(npcf, ngals, nbins, lbox, rmax, lls=None, verbose=verbose)
-    zetas.init_coeff()
+    zetas = calc_NPCF(npcf, ngals, nbins, lbox, rmax, Nmax, lls=None, verbose=verbose)
+    #zetas.init_coeff(Numblocks)
     zetas.run()
     sdir = "/home/ronanhix/orange/"
     sname1 = sdir+f"results/coeff_{npcf:0d}pcf_ngals{ngals:0d}_nbins{nbins:0d}_lbox{lbox:0d}_rmax{rmax:0d}"
