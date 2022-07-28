@@ -245,19 +245,19 @@ class calc_NPCF(object):
         # of neighbouring galaxies (whichever is smaller). 
         # masterballct is an object that contains a list of tuples of the indices of secondary galaxies
         tcomb1 = time.time()
-        combo = combinations(np.arange(np.min([self.Nmax,len(self.galcoords)]),dtype=self.intdtype), int(self.npcf-1))
-        masterballct_cpu = np.fromiter(chain.from_iterable(combo),dtype=self.intdtype).reshape(-1,int(self.npcf-1))
+        combo = chain.from_iterable(combinations(np.arange(np.min([self.Nmax,len(self.galcoords)]),dtype=self.intdtype), int(self.npcf-1)))
+        masterballct_cpu = np.fromiter(combo,dtype=self.intdtype).reshape(-1,int(self.npcf-1))
         tcomb2 = time.time()
+        masterballct = cp.asarray(masterballct_cpu, dtype='int16')
         print(f"tcomb: {tcomb2- tcomb1}")
         print(f"Memory (MB): {masterballct_cpu.nbytes/1024/1024}")
         print(f"Mem Total: {mempool.total_bytes()/1024/1024}")
         print(f"Mem Used: {mempool.used_bytes()/1024/1024}")
-        masterballct = cp.asarray(masterballct_cpu, dtype='int16')
         t2 = time.time()
         print(f"time: {t2-t1}")
         
         #Calculates the optimal number of blocks and assigns storage array
-        self.Numblocks = math.ceil(masterballct.shape[0]/1024)+1
+        self.Numblocks = math.ceil(masterballct.shape[0]/1024/(10**(self.npcf-3)))+1
         print(f"Number of Blocks: {self.Numblocks}")
         self.init_coeff(self.Numblocks)
         
@@ -588,8 +588,6 @@ class calc_NPCF(object):
             self.ballct_func((self.Numblocks,), (1024,),(masterballct.view(self.shortvec),masterballct.shape[0],second_coord_3d.shape[0],comb_ballct_arr))
             
             #print(second_coord_3d_np.shape)
-            #print(f"Coords: {second_coord_3d_np.nbytes/1024/1024}")
-            #print(f"Radial: {second_coord_radial_np.nbytes/1024/1024}")
             #print(f"Ballct: {comb_ballct_arr.nbytes/1024/1024}")
             #print(f"Master Ballct: {masterballct.nbytes/1024/1024}")
 
@@ -601,9 +599,10 @@ class calc_NPCF(object):
             sides = cp.zeros((len(comb_ballct_arr),(self.npcf-1)), dtype='int16').view(self.shortvec)
             self.sides_func((self.Numblocks,), (1024,),(second_coord_radial,comb_ballct_arr,len(comb_ballct_arr),self.rmax,self.nbins,sides))
             
+            #print(f"Storage array: {self.zeta_re['110'].nbytes/1024/1024}")
             #print(f"Sides: {sides.nbytes/1024/1024}")
-            print(f"Mem: {mempool.total_bytes()/1024/1024}")
-            print(f"Mem: {mempool.used_bytes()/1024/1024}")
+            #print(f"Mem tot: {mempool.total_bytes()/1024/1024}")
+            #print(f"Mem used: {mempool.used_bytes()/1024/1024}")
 
             if sides.shape[0] >= 1: #Excludes primaries with too few secondaries
                 second_coord_3d = second_coord_3d.view(self.double3)   
@@ -625,8 +624,8 @@ class calc_NPCF(object):
                                                         self.zeta_re['110'],self.zeta_im['111'],self.zeta_re['112'],self.zeta_re['222'],
                                                         comb_ballct_arr.shape[0],shape))
                     
-                print(f"Mem: {mempool.total_bytes()/1024/1024}")
-                print(f"Mem: {mempool.used_bytes()/1024/1024}")
+                print(f"Mem tot: {mempool.total_bytes()/1024/1024}")
+                print(f"Mem used: {mempool.used_bytes()/1024/1024}")
         #                if self.verbose: print("    order", il, "coefficients",new_zeta)
         #         self.zeta = numpy.average(numpy.array(list(self.zeta.values())),axis=0).real
                 #print(self.zeta_im['110'])
@@ -637,11 +636,11 @@ if __name__ == "__main__":
     start_time = time.time()
 
     npcf = 3
-    ngals = 500000
+    ngals = 20000
     nbins = 10
     lbox = 20
-    rmax = 2
-    Nmax = 5000
+    rmax = 20
+    Nmax = 25000
     #Numblocks = 306000
     # lls_5pcf = ['11(0)11', '21(1)12']
     verbose=False
