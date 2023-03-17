@@ -83,7 +83,14 @@ class calc_NPCF(object):
             numpy.savetxt(sname + '.txt', infile)
             print(">> save file to", sname + '.txt')
         
-            
+    def read(self,datfile):
+        '''
+        Read data from CSV
+        '''
+        numpy.random.seed(10)
+        self.galcoords = self.lbox * np.random.rand(self.ngals, 3)
+        
+        
     def make_catalog(self):
         
         '''
@@ -101,14 +108,12 @@ class calc_NPCF(object):
         mempool = cp.get_default_memory_pool()
         print(f"Mem: {mempool.total_bytes()/1024/1024}")
         print(f"Mem: {mempool.used_bytes()/1024/1024}")
-        numpy.random.seed(10)
-        eps = 1e-8
         #print(cp.cuda.Device().attributes)
         
-        # Define coords and computationally expensive combinatorics
+        # Define computationally expensive combinatorics
         # that can be referenced by every primary galaxy loop
-        self.galcoords = self.lbox * np.random.rand(self.ngals, 3)
-        tree = spatial.cKDTree(self.galcoords,leafsize=self.lbox)
+        self.read("test.txt")
+        eps = 1e-8
         galcoords_gpu = cp.array(self.galcoords, dtype=cp.float64)
         t1 = time.time()
         if self.Nmax < 30000:
@@ -155,10 +160,12 @@ class calc_NPCF(object):
         print(f"time: {t2-t1}")
         
         #Calculates the optimal number of blocks and assigns storage array
-        self.Numblocks = math.ceil(sidecombos.shape[0]/64/(10**(self.npcf-3)))*self.numprimes
+        self.Numblocks = math.ceil(sidecombos.shape[0]/64)*self.numprimes
+        
+        
+        print(sidecombos.shape)
         print(f"Number of Blocks: {self.Numblocks}")
         self.init_coeff(self.Numblocks)
-        
         
         
         #C++ Code for CUDA Kernels
@@ -206,7 +213,115 @@ class calc_NPCF(object):
                                             2*(binvalsmix[inlocx].z*binvalsmix[inlocy].z)-
                                             1./3.*(bincounts[inlocx]*bincounts[inlocy]));
                 }
-            }       
+            }    
+        extern "C" __global__ void add_func_4PCF(const short3* sides,
+                                            int3 out_shape,
+                                            int in_shape,
+                                            int numprimes,
+                                            int nbins,
+                                            double3* binvals,
+                                            double3* binvalssq,
+                                            double3* binvalsmix,
+                                            int* bincounts,
+                                            double* out_110,
+                                            double* out_111,
+                                            double* out_112,
+                                            double* out_222){
+            int i = blockDim.x * blockIdx.x + threadIdx.x;
+            int k = i / in_shape;
+            int j = i - k*in_shape;
+            if (i < in_shape*numprimes
+                && bincounts[sides[j].x + k*nbins] > 0
+                && bincounts[sides[j].y + k*nbins] > 0
+                && bincounts[sides[j].z + k*nbins] > 0
+                ){
+                    //int loc = (sides[i].z+(out_shape.z*sides[i].y)+(out_shape.z*out_shape.y*sides[i].x))
+                    int loc = (sides[j].z+(out_shape.z*sides[j].y)+(out_shape.z*out_shape.y*sides[j].x)); //Fix this line
+                    int inlocx = sides[j].x + k*nbins;
+                    int inlocy = sides[j].y + k*nbins;
+                    int inlocz = sides[j].z + k*nbins;
+                    
+                    
+                    out_110[loc] += 
+                        -sqrtf(3./(4.*PI))/(4.*PI)*bincounts[inlocz]*((binvals[inlocx].x*binvals[inlocy].x)+
+                                            (binvals[inlocx].y*binvals[inlocy].y)+
+                                            (binvals[inlocx].z*binvals[inlocy].z));
+                        
+                    //111 is imaginary
+                    out_111[loc] += ((-3)/(sqrtf(2*pow(4.*PI,3.)))) * 
+                                    (binvals[inlocx].x * (binvals[inlocy].y * binvals[inlocz].z - binvals[inlocy].z *binvals[inlocz].y) 
+                                    - binvals[inlocx].y * (binvals[inlocy].x * binvals[inlocz].z - binvals[inlocy].z *binvals[inlocz].x)
+                                    + binvals[inlocx].z * (binvals[inlocy].x * binvals[inlocz].y - binvals[inlocy].y *binvals[inlocz].x));
+                        
+                    //binvalssq.x = R_xx, binvalsmix.x = R_xy, binvalsmix.y = R_xz, binvalsmix.z = R_yz,
+                    
+                    out_112[loc] += sqrtf(27/(2*pow(4.*PI,3.)))*(
+                                    ((binvalssq[inlocz].x * binvals[inlocx].x * binvals[inlocy].x) 
+                                    + (binvalsmix[inlocz].x * binvals[inlocx].x * binvals[inlocy].y) 
+                                    + (binvalsmix[inlocz].y * binvals[inlocx].x * binvals[inlocy].z)
+                                    + (binvalssq[inlocz].y * binvals[inlocx].y * binvals[inlocy].y) 
+                                    + (binvalsmix[inlocz].x * binvals[inlocx].y * binvals[inlocy].x) 
+                                    + (binvalsmix[inlocz].z * binvals[inlocx].y * binvals[inlocy].z)
+                                    + (binvalssq[inlocz].z * binvals[inlocx].z * binvals[inlocy].z) 
+                                    + (binvalsmix[inlocz].y * binvals[inlocx].z * binvals[inlocy].x) 
+                                    + (binvalsmix[inlocz].z * binvals[inlocx].z * binvals[inlocy].y))
+                                    - (1./3. * (bincounts[inlocz]*((binvals[inlocx].x*binvals[inlocy].x)+
+                                                            (binvals[inlocx].y*binvals[inlocy].y)+
+                                                            (binvals[inlocx].z*binvals[inlocy].z))))
+                                                            );
+                    
+                    //FIX THIS
+                    out_222[loc] += ((-45.)/(sqrtf(14*pow(4.*PI,3.))))*(
+                                (((binvalssq[inlocz].x * binvalssq[inlocx].x * binvalssq[inlocy].x) 
+                                    + (binvalsmix[inlocz].x * binvalssq[inlocx].x * binvalsmix[inlocy].x) 
+                                    + (binvalsmix[inlocz].y * binvalssq[inlocx].x * binvalsmix[inlocy].y)
+                                    + (binvalssq[inlocz].y * binvalsmix[inlocx].x * binvalsmix[inlocy].x) 
+                                    + (binvalsmix[inlocz].x * binvalsmix[inlocx].x * binvalssq[inlocy].x) 
+                                    + (binvalsmix[inlocz].z * binvalsmix[inlocx].x * binvalsmix[inlocy].y)
+                                    + (binvalssq[inlocz].z * binvalsmix[inlocx].y * binvalsmix[inlocy].y) 
+                                    + (binvalsmix[inlocz].y * binvalsmix[inlocx].y * binvalssq[inlocy].x) 
+                                    + (binvalsmix[inlocz].z * binvalsmix[inlocx].y * binvalsmix[inlocy].x))
+                                +((binvalssq[inlocz].x * binvalsmix[inlocx].x * binvalsmix[inlocy].x) 
+                                    + (binvalsmix[inlocz].x * binvalsmix[inlocx].x * binvalssq[inlocy].y) 
+                                    + (binvalsmix[inlocz].y * binvalsmix[inlocx].x * binvalsmix[inlocy].z)
+                                    + (binvalssq[inlocz].y * binvalssq[inlocx].y * binvalssq[inlocy].y) 
+                                    + (binvalsmix[inlocz].x * binvalssq[inlocx].y * binvalsmix[inlocy].x) 
+                                    + (binvalsmix[inlocz].z * binvalssq[inlocx].y * binvalsmix[inlocy].z)
+                                    + (binvalssq[inlocz].z * binvalsmix[inlocx].z * binvalsmix[inlocy].z) 
+                                    + (binvalsmix[inlocz].y * binvalsmix[inlocx].z * binvalsmix[inlocy].x) 
+                                    + (binvalsmix[inlocz].z * binvalsmix[inlocx].z * binvalssq[inlocy].y))
+                                +((binvalssq[inlocz].x * binvalsmix[inlocx].y * binvalsmix[inlocy].y) 
+                                    + (binvalsmix[inlocz].x * binvalsmix[inlocx].y * binvalsmix[inlocy].z) 
+                                    + (binvalsmix[inlocz].y * binvalsmix[inlocx].y * binvalssq[inlocy].z)
+                                    + (binvalssq[inlocz].y * binvalsmix[inlocx].z * binvalsmix[inlocy].z) 
+                                    + (binvalsmix[inlocz].x * binvalsmix[inlocx].z * binvalsmix[inlocy].y) 
+                                    + (binvalsmix[inlocz].z * binvalsmix[inlocx].z * binvalssq[inlocy].z)
+                                    + (binvalssq[inlocz].z * binvalssq[inlocx].z * binvalssq[inlocy].z) 
+                                    + (binvalsmix[inlocz].y * binvalssq[inlocx].z * binvalsmix[inlocy].y) 
+                                    + (binvalsmix[inlocz].z * binvalssq[inlocx].z * binvalsmix[inlocy].z)))
+                                - (1./3. * bincounts[inlocz]*((binvalssq[inlocx].x*binvalssq[inlocy].x)+
+                                                            (binvalssq[inlocx].y*binvalssq[inlocy].y)+
+                                                            (binvalssq[inlocx].z*binvalssq[inlocy].z)+
+                                                            2*(binvalsmix[inlocx].x*binvalsmix[inlocy].x)+
+                                                            2*(binvalsmix[inlocx].y*binvalsmix[inlocy].y)+
+                                                            2*(binvalsmix[inlocx].z*binvalsmix[inlocy].z)))
+                                - (1./3. * bincounts[inlocy]*((binvalssq[inlocx].x*binvalssq[inlocz].x)+
+                                                            (binvalssq[inlocx].y*binvalssq[inlocz].y)+
+                                                            (binvalssq[inlocx].z*binvalssq[inlocz].z)+
+                                                            2*(binvalsmix[inlocx].x*binvalsmix[inlocz].x)+
+                                                            2*(binvalsmix[inlocx].y*binvalsmix[inlocz].y)+
+                                                            2*(binvalsmix[inlocx].z*binvalsmix[inlocz].z)))                        
+                                - (1./3. * bincounts[inlocx]*((binvalssq[inlocz].x*binvalssq[inlocy].x)+
+                                                            (binvalssq[inlocz].y*binvalssq[inlocy].y)+
+                                                            (binvalssq[inlocz].z*binvalssq[inlocy].z)+
+                                                            2*(binvalsmix[inlocz].x*binvalsmix[inlocy].x)+
+                                                            2*(binvalsmix[inlocz].y*binvalsmix[inlocy].y)+
+                                                            2*(binvalsmix[inlocz].z*binvalsmix[inlocy].z)))
+                                +2./9. * bincounts[inlocx] * bincounts[inlocy] * bincounts[inlocz]
+                                );
+                                   
+                }
+            } 
         extern "C" __global__ void add_func_single_3PCF(const short2* sides,
                                             int2 out_shape,
                                             int in_shape,
@@ -250,6 +365,11 @@ class calc_NPCF(object):
                                 lhs.y / divisor,
                                 lhs.z / divisor);
         }
+        __device__ double3 operator-(const double3& lhs, const double3& rhs){
+            return make_double3(lhs.x - rhs.x,
+                                lhs.y - rhs.y,
+                                lhs.z - rhs.z);
+        }
         __device__ double dot(const double3& lhs, const double3& rhs) {
             return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
         }
@@ -260,8 +380,8 @@ class calc_NPCF(object):
             return lhs/norm(lhs);
         }
         // Assigns galaxies to radial bins
-        extern "C" __global__ void histogram(const double* rad_coord,
-                                            double3* coords,
+        extern "C" __global__ void histogram(const double3* incoords,
+                                            double3* primcoord,
                                             int shape,
                                             int rmax,
                                             int nbins,
@@ -272,29 +392,50 @@ class calc_NPCF(object):
                                             int* out_count){                                           
             int i = blockDim.x * blockIdx.x + threadIdx.x;
             if(i < shape
-                && (fabsf(coords[i].x) > 0
-                or fabsf(coords[i].y) > 0
-                or fabsf(coords[i].z > 0))){
+                && (fabsf(incoords[i].x) > 0
+                or fabsf(incoords[i].y) > 0
+                or fabsf(incoords[i].z > 0))){
+               
+                
+                double dist = norm(incoords[i]-primcoord[0]);
+                
+                if ((dist < rmax) && (dist > 0)){ //Checks for close partners and removes primary
+                    double3 coords = normalize(incoords[i]-primcoord[0]); //Normalizes coordinates 
+                    int k = i / numseconds;
+                    int j = __double2int_rz(dist/rmax*nbins); //Finds Bin index
+                    atomicAdd(&out_count[j+k*nbins],1);
 
-                coords[i] = normalize(coords[i]);
-                int k = i / numseconds;
-                int j = __double2int_rz(rad_coord[i]/rmax*nbins);
-                atomicAdd(&out_count[j+k*nbins],1);
-                
-                atomicAdd(&out1[j+k*nbins].x,coords[i].x);
-                atomicAdd(&out1[j+k*nbins].y,coords[i].y);
-                atomicAdd(&out1[j+k*nbins].z,coords[i].z);
-                
-                atomicAdd(&out2[j+k*nbins].x,coords[i].x*coords[i].x);
-                atomicAdd(&out2[j+k*nbins].y,coords[i].y*coords[i].y);
-                atomicAdd(&out2[j+k*nbins].z,coords[i].z*coords[i].z);
-                
-                atomicAdd(&outmix[j+k*nbins].x,coords[i].x*coords[i].y);
-                atomicAdd(&outmix[j+k*nbins].y,coords[i].x*coords[i].z);
-                atomicAdd(&outmix[j+k*nbins].z,coords[i].y*coords[i].z);
+                    atomicAdd(&out1[j+k*nbins].x,coords.x);
+                    atomicAdd(&out1[j+k*nbins].y,coords.y);
+                    atomicAdd(&out1[j+k*nbins].z,coords.z);
+
+                    atomicAdd(&out2[j+k*nbins].x,coords.x*coords.x);
+                    atomicAdd(&out2[j+k*nbins].y,coords.y*coords.y);
+                    atomicAdd(&out2[j+k*nbins].z,coords.z*coords.z);
+
+                    atomicAdd(&outmix[j+k*nbins].x,coords.x*coords.y);
+                    atomicAdd(&outmix[j+k*nbins].y,coords.x*coords.z);
+                    atomicAdd(&outmix[j+k*nbins].z,coords.y*coords.z);
+                    
+                }
             }
         }
+    extern "C" __global__ void partner(double3* coords,
+                                        double3 primcoords,
+                                        double rmax,
+                                        double* outradial,
+                                        double3* outcoord){
+        
+        int i = blockDim.x * blockIdx.x + threadIdx.x;
+        outcoord[i].x = coords[i].x - primcoords.x;
+        outcoord[i].y = coords[i].y - primcoords.y;
+        outcoord[i].z = coords[i].z - primcoords.z;
+        double dist = norm(outcoord[i]);
+        if(norm(outcoord[i]) <= rmax){
+            outradial[i] = dist;
+        }
 
+    }
         '''
         
         P_lambda_code = '''
@@ -311,9 +452,8 @@ class calc_NPCF(object):
                 self.hist = manip_module.get_function('histogram')
                 self.N3_and_add = add_module.get_function('add_func_3PCF')
         elif self.npcf == 4:
-            self.ballct_func = manip_module.get_function('get_ballct_4PCF')
-            self.sides_func = manip_module.get_function('get_sides_4PCF')
-            self.N4_and_add = P_lambda_module.get_function('N4_coeff_add')
+            self.hist = manip_module.get_function('histogram')
+            self.N4_and_add = add_module.get_function('add_func_4PCF')
             
         else:
             print('Stop That')
@@ -335,94 +475,92 @@ class calc_NPCF(object):
                 coord_lengths[n] = len(second_coord_radial)
                 running_lengths[n] = running_lengths[n-1]+len(second_coord_radial)
         '''
-        #print(masterprime)
+        # self.master_counts = cp.zeros(self.numprimes*self.nbins, dtype='int32')  
+        # self.master_hist1 = cp.zeros(self.numprimes*self.nbins*3, dtype='float64').reshape(self.numprimes,self.nbins,3)
+        # self.master_hist2 = cp.zeros(self.numprimes*self.nbins*3, dtype='float64').reshape(self.numprimes,self.nbins,3)
+        # self.master_histmix = cp.zeros(self.numprimes*self.nbins*3, dtype='float64').reshape(self.numprimes,self.nbins,3)
+        
+
         for ii in range(self.ngals//self.numprimes): 
+
+            #print(benchmark(self.get_coords_mult,(np.arange(40),eps,tree,galcoords_gpu), n_repeat=10,n_warmup=10))
+            #print(benchmark(self.get_coords,(ii,eps,tree,galcoords_gpu), n_repeat=10,n_warmup=10))
             if self.numprimes == 1:
-                print(f">> sit on {ii}th galaxy")
-                second_coord_3d_to_pass,second_coord_radial_to_pass = self.get_coords(ii,eps,tree,galcoords_gpu) 
-                coord_lengths_to_pass[0] = len(second_coord_radial_to_pass)
+                print(f">> sit on {ii}th galaxy")               
                 '''
-                print(running_lengths[ii],ii)
-                second_coord_3d_to_pass = second_coord_3d_master[running_lengths[ii]-coord_lengths[ii]:running_lengths[ii]]
-                second_coord_radial_to_pass = second_coord_radial_master[running_lengths[ii]-coord_lengths[ii]:running_lengths[ii]]
-                coord_lengths_to_pass = coord_lengths[ii]
+                second_coord_3d_to_pass,second_coord_radial_to_pass = self.get_coords(ii,eps,tree,galcoords_gpu) 
                 '''
             else:
-                #second_coord_3d_to_pass = cp.array([[],[],[]]).reshape((0,3))
-                second_coord_3d_to_pass = cp.zeros(3*self.numseconds*self.numprimes).reshape((self.numseconds*self.numprimes,3)) #Creates scaffold array for coordinates
-                second_coord_radial_to_pass = cp.zeros(self.numseconds*self.numprimes)
+                primaries_to_pass = cp.zeros(self.numseconds*self.numprimes)
+                seconds_to_pass = cp.zeros(self.numseconds*self.numprimes)
                 primes=masterprime+ii
-                print(f">> sit on {primes}th galaxy")
-                #second_coord_3d,second_coord_radial = self.get_coords(primes[0],eps,tree,galcoords_gpu)
-                for n, prime in enumerate(primes):
-                    second_coord_3d,second_coord_radial = self.get_coords(prime,eps,tree,galcoords_gpu)
-                    num = len(second_coord_radial)
-                    if num > self.numseconds:
-                        print("Error: More secondaries found for galaxy {prime} than the secondary cap. Please increase secondary cap.")
-                    coord_lengths_to_pass[n] = num
-                    second_coord_3d_to_pass[n*self.numseconds:n*self.numseconds+num] = second_coord_3d
-                    second_coord_radial_to_pass[n*self.numseconds:n*self.numseconds+num] = second_coord_radial
+                if primes%100 == 0:
+                    print(f">> sit on {primes}th galaxy")
+                    
+                self.loop_accum(primes,eps,tree,seconds_to_pass,primaries_to_pass)
+		#seconds_to_pass, primaries_to_pass = self.loop_accum(primes,eps,tree,seconds_list,primaries_list)
+                print(benchmark(self.loop_accum_old,(primes,galcoords_gpu,eps,tree,seconds_to_pass,coord_lengths_to_pass), n_repeat=10,n_warmup=10))
+                
+                
+#                 for n, prime in enumerate(primes):
+#                     second_coord_3d,second_coord_radial = self.get_coords(prime,eps,tree,galcoords_gpu)
+#                     num = len(second_coord_radial)
+#                     if num > self.numseconds:
+#                         print("Error: More secondaries found for galaxy {prime} than the secondary cap. Please increase secondary cap.")
+#                     coord_lengths_to_pass[n] = num
+#                     second_coord_3d_to_pass[n*self.numseconds:n*self.numseconds+num] = second_coord_3d
+#                     second_coord_radial_to_pass[n*self.numseconds:n*self.numseconds+num] = second_coord_radial
                     
 
-            self.run_some_gals(ii,second_coord_3d_to_pass,second_coord_radial_to_pass,allsides,coord_lengths_to_pass)
-            print(benchmark(self.get_coords,(ii,eps,tree,galcoords_gpu), n_repeat=10,n_warmup=10))
-            print(benchmark(self.run_some_gals,(ii,second_coord_3d_to_pass,second_coord_radial_to_pass,allsides,coord_lengths_to_pass), n_repeat=10,n_warmup=10))
+            self.run_some_gals(ii,galcoords_gpu,allsides)
+        #self.run_some_gals(ii,second_coord_3d_to_pass,second_coord_radial_to_pass,allsides,coord_lengths_to_pass)
+            #print(benchmark(self.run_some_gals,(ii,second_coord_3d_to_pass,second_coord_radial_to_pass,allsides,coord_lengths_to_pass), n_repeat=10,n_warmup=10))
         for il in self.lls:
             self.zeta[il] = cp.sum(self.zeta_re[il],axis=0) + 1j*cp.sum(self.zeta_im[il],axis=0)
         print(f"Problems Encountered: {self.problems}")
         print(self.zeta)
 
-        
+
     def get_coords(self,ii,eps,tree,galcoords_gpu):    
         prime_coord_3d = galcoords_gpu[ii]
         # ballct: list of indices of the secondary galaxies of the current primary galaxy
         ballct = tree.query_ball_point(self.galcoords[ii], self.rmax+eps)
         ballct.remove(ii)
-        # coordinates of the secondary galaxies 
-        second_coord_3d = galcoords_gpu[ballct] - prime_coord_3d   
-        second_coord_radial = np.sqrt(np.sum(second_coord_3d**2, axis=1))
         
-        # sort the secondary galaxies according to their distance
-        '''
-        sort = second_coord_radial.argsort()
-        second_coord_3d = second_coord_3d[sort]
-        second_coord_radial = second_coord_radial[sort]
-        '''
-        #print(type(second_coord_3d))
+        return ballct#(second_coord_3d,second_coord_radial)
+    def CUDA_get_coords(self, ii, galcoords_gpu):
+        coords_hold_3d = cp.zeros()#Create array of zeros to hold output of CUDA
+        #Call CUDA here
+        indicies = cp.nonzero(coords_hold_3d)
+        second_coord_3d = coords_hold_3d[indicies]
+        second_coord_radial = coords_hold_radial[indicies]
         return (second_coord_3d,second_coord_radial)
-    
-    def run_some_gals(self,ii,second_coord_3d,second_coord_radial,allsides,coord_lengths):
+        
+        
+    def run_some_gals(self,ii,second_coord_3d,allsides):
         #print(f">> also sit on {ii+self.ngals/2}th galaxy")
         #mempool = cp.get_default_memory_pool()
         #print(f"Mem tot: {mempool.total_bytes()/1024/1024}")
         #print(f"Mem used: {mempool.used_bytes()/1024/1024}")
 
-        #ballct,second_coord_3d,second_coord_radial = self.get_coords(ii,eps,tree,galcoords_gpu)
-        
+        #print(second_coord_3d.shape)
         if second_coord_3d.shape[0] >= (self.npcf-1): #Excludes primaries with too few secondaries
             
             print(f"Num Secondaries: {second_coord_3d.shape[0]}")
 
-
-
-            
-
-        
-            #Gets the radial bin index of the N-1 secondary galaxies
-            #histx, bins = cp.histogram(second_coord_radial,bins=self.nbins,range = (0,self.rmax),weights=second_coord_3d[:,0])
-            #histy, _ = cp.histogram(second_coord_radial,bins=self.nbins,range = (0,self.rmax),weights=second_coord_3d[:,1])
-            #histz, _ = cp.histogram(second_coord_radial,bins=self.nbins,range = (0,self.rmax),weights=second_coord_3d[:,2])
-            
-            
             counts = cp.zeros(self.numprimes*self.nbins, dtype='int32')  
             hist1 = cp.zeros(self.numprimes*self.nbins*3, dtype='float64').reshape(self.numprimes,self.nbins,3).view(self.double3)
             hist2 = cp.zeros(self.numprimes*self.nbins*3, dtype='float64').reshape(self.numprimes,self.nbins,3).view(self.double3)
             histmix = cp.zeros(self.numprimes*self.nbins*3, dtype='float64').reshape(self.numprimes,self.nbins,3).view(self.double3)
+            
+            
             second_coord_3d = second_coord_3d.view(self.double3)
-            nhistblocks = math.ceil(len(second_coord_radial)/1024)
+            nhistblocks = math.ceil(len(second_coord_3d)/1024)
             #print(nhistblocks)
-            self.hist((nhistblocks,), (1024,),(second_coord_radial,second_coord_3d,
-                                            len(second_coord_radial),self.rmax,self.nbins,self.numseconds,
+            #blongo = cp.zeros(self.numprimes*self.nbins, dtype='int32')  
+            #print(second_coord_3d[ii][0])
+            self.hist((nhistblocks,), (1024,),(second_coord_3d,second_coord_3d[ii][0],
+                                            len(second_coord_3d),self.rmax,self.nbins,self.numseconds,
                                             hist1,hist2,histmix,counts))
             #unique, counts = cp.unique(sides,return_counts=True)
             #print(second_coord_radial)
@@ -439,6 +577,8 @@ class calc_NPCF(object):
             second_coord_3d = second_coord_3d.view(self.double3)   
             if self.npcf ==3:
                 #Shape of the output array - used for indexing in function call
+                #print(hist1.shape)
+                #print(allsides.shape[0])
                 allsides = allsides.view(self.short2)
                 shape = np.asarray([self.zeta_re[self.lls[0]].shape[1],self.zeta_re[self.lls[0]].shape[2]]).astype(np.int32).view(self.int2)
                 #Calculates coefficients and adds them to zeta
@@ -447,7 +587,14 @@ class calc_NPCF(object):
                                                     self.zeta_re['00'],self.zeta_re['11'],self.zeta_re['22'],
                                                     ))
             elif self.npcf == 4:
-                print("No")
+                allsides = allsides.view(self.short3)
+                shape = np.asarray([self.zeta_re[self.lls[0]].shape[1],self.zeta_re[self.lls[0]].shape[2],self.zeta_re[self.lls[0]].shape[3]]).astype(np.int32).view(self.int3)
+                #Calculates coefficients and adds them to zeta
+                #print(self.Numblocks)
+                #print(allsides)
+                self.N4_and_add((self.Numblocks,), (64,),(allsides,shape,allsides.shape[0],self.numprimes,self.nbins,hist1,hist2,histmix,counts,
+                                                    self.zeta_re['110'],self.zeta_im['111'],self.zeta_re['112'],self.zeta_re['222'],
+                                                    ))
 
                 #print(f"Mem tot: {mempool.total_bytes()/1024/1024}")
                 #print(f"Mem used: {mempool.used_bytes()/1024/1024}")
@@ -460,13 +607,13 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    npcf = 3
+    npcf = 4
     ngals = 1000000
     nbins = 10
     lbox = 20
     rmax = 2
-    Nmax = 5000
-    numprimes = 40
+    Nmax = 1000000
+    numprimes = 1
     numseconds = np.minimum(Nmax,ngals) #ngals
     #Numblocks = 306000
     # lls_5pcf = ['11(0)11', '21(1)12']
